@@ -1,0 +1,29 @@
+# Bufo Bot — deploy to /opt/bufo on the playground server
+#
+# Setup:
+#   1. Clone repo to /opt/bufo
+#   2. Create .env with BOT_TOKEN and APP_TOKEN
+#   3. docker compose up -d
+#
+# .env required vars:
+#   BOT_TOKEN=xoxb-...   (bot oauth token)
+#   APP_TOKEN=xapp-...    (app-level token for Socket Mode)
+#
+# /bufo-suggest requires `claude` CLI installed on host (not in container).
+# Until we switch to Anthropic API, suggest won't work in Docker.
+#
+# Local-only things that this replaces:
+#   - ~/Library/LaunchAgents/com.bufo.discovery-bot.plist (watchdog)
+#   - ~/Library/LaunchAgents/com.bufo.community-sync.plist (daily sync)
+#   - scripts/bufo-discovery-start.sh (caffeinate wrapper)
+
+services:
+  bufo-bot:
+    build: .
+    container_name: bufo-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./bufo-manifest.json:/opt/bufo/bufo-manifest.json:ro
+      - ./bufo-descriptions.json:/opt/bufo/bufo-descriptions.json:ro

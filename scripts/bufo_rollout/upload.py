@@ -51,6 +51,111 @@ def load_credentials() -> tuple[str, str, str] | None:
     return cookie_d, workspace, token
 
 
+BUFO_TEST_CHANNEL_ID = os.getenv("BUFO_TEST_CHANNEL_ID", "")
+BUFO_META_CHANNEL_ID = os.getenv("BUFO_META_CHANNEL_ID", "")
+
+
+def notify_new_drop(message: str, channel_id: str = BUFO_TEST_CHANNEL_ID) -> bool:
+    """Send a batch announcement via the webhook.
+
+    Args:
+        message: The announcement text to post.
+        channel_id: Slack channel ID to post to.
+
+    Returns True on success, False on failure.
+    """
+    load_dotenv()
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if not webhook_url:
+        print("  No WEBHOOK_URL in .env, skipping notification")
+        return False
+
+    try:
+        resp = requests.post(webhook_url, json={
+            "channel_id": channel_id,
+            "message": message,
+        })
+        return resp.ok
+    except Exception as e:
+        print(f"  Webhook error: {e}")
+        return False
+
+
+def load_bot_token() -> str | None:
+    """Load the BOT_TOKEN from .env."""
+    load_dotenv()
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        print("  No BOT_TOKEN in .env. See scripts/manage-slack-app.py for setup.")
+    return token
+
+
+def post_message(text: str, channel_id: str, bot_token: str) -> str | None:
+    """Post a message to Slack via chat.postMessage.
+
+    Returns the message 'ts' on success, None on failure.
+    """
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            json={"channel": channel_id, "text": text},
+        )
+        result = resp.json()
+    except Exception as e:
+        print(f"  Post error: {e}")
+        return None
+
+    if result.get("ok"):
+        return result.get("ts")
+
+    print(f"  Post failed: {result.get('error')}")
+    return None
+
+
+def update_message(text: str, channel_id: str, ts: str, bot_token: str) -> bool:
+    """Update an existing Slack message via chat.update.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.update",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            json={"channel": channel_id, "ts": ts, "text": text},
+        )
+        result = resp.json()
+    except Exception as e:
+        print(f"  Update error: {e}")
+        return False
+
+    if result.get("ok"):
+        return True
+
+    print(f"  Update failed: {result.get('error')}")
+    return False
+
+
+def add_reaction(channel_id: str, ts: str, reaction: str, bot_token: str) -> bool:
+    """Add a reaction to a message. Returns True on success."""
+    try:
+        resp = requests.post(
+            "https://slack.com/api/reactions.add",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            json={"channel": channel_id, "timestamp": ts, "name": reaction},
+        )
+        result = resp.json()
+    except Exception as e:
+        print(f"  Reaction error: {e}")
+        return False
+
+    if result.get("ok"):
+        return True
+
+    print(f"  Reaction failed: {result.get('error')}")
+    return False
+
+
 def upload_emoji(
     name: str,
     file_path: Path,
@@ -107,6 +212,45 @@ def upload_emoji(
             return False
 
     print(f"  Max retries exceeded for :{name}:")
+    return False
+
+
+def remove_emoji(
+    name: str,
+    cookie_d: str,
+    workspace: str,
+    token: str,
+) -> bool:
+    """Remove a single emoji from Slack.
+
+    Returns True on success, False on failure.
+    """
+    url = f"https://{workspace}.slack.com/api/emoji.remove"
+
+    headers = {
+        "Cookie": f"d={cookie_d}",
+    }
+    data = {
+        "name": name,
+        "token": token,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=data)
+        result = resp.json()
+    except Exception as e:
+        print(f"  Request error: {e}")
+        return False
+
+    if result.get("ok"):
+        return True
+
+    error = result.get("error", "unknown")
+    if error == "no_permission":
+        print(f"  No permission to remove :{name}:")
+        return False
+
+    print(f"  Remove failed: {error}")
     return False
 
 

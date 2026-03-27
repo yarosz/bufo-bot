@@ -6,13 +6,15 @@ Sneakily upload bufo emojis to Slack on a Fibonacci daily schedule.
 
 import argparse
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from scripts.bufo_rollout.manifest import (
     MANIFEST_PATH, load_manifest, save_manifest,
     find_emoji, get_batch_emojis, get_pending_in_batch,
-    mark_uploaded, mark_external, mark_skipped, validate_manifest,
+    mark_uploaded, mark_external, mark_skipped, mark_pending, validate_manifest,
+    get_announcement, set_announcement,
 )
 from scripts.bufo_rollout.naming import resolve_collisions
 from scripts.bufo_rollout.schedule import fibonacci_schedule, assign_batches
@@ -125,46 +127,104 @@ def cmd_upload(args):
 
     if not pending:
         print(f"Batch {batch_num}: all {len(all_in_batch)} emojis already uploaded/skipped.")
-        return 0
-
-    print(f"Batch {batch_num}: {len(pending)} pending out of {len(all_in_batch)} total.")
+    else:
+        print(f"Batch {batch_num}: {len(pending)} pending out of {len(all_in_batch)} total.")
 
     if args.dry_run:
-        print("\n[DRY RUN] Would upload:")
-        for e in pending:
-            print(f"  :{e['slack_name']}: <- {e['source_file']}")
+        if pending:
+            print("\n[DRY RUN] Would upload:")
+            for e in pending:
+                print(f"  :{e['slack_name']}: <- {e['source_file']}")
         return 0
 
-    # Only check upload deps when actually uploading
-    from scripts.bufo_rollout.upload import check_upload_deps, load_credentials, upload_emoji
+    # Announcement review (before upload)
+    announcement = None
+    roll_call = None
+    if not args.no_announce:
+        from scripts.bufo_rollout.announce import interactive_review
 
-    if not check_upload_deps():
-        return 1
+        emoji_names = [e["slack_name"] for e in all_in_batch]
+        existing = get_announcement(manifest, batch_num)
+        announcement, roll_call = interactive_review(emoji_names, batch_num, len(all_in_batch), existing)
 
-    # Load credentials
-    creds = load_credentials()
-    if not creds:
-        return 1
-    cookie_d, workspace, token = creds
+        if announcement:
+            set_announcement(manifest, batch_num, announcement)
+            save_manifest(manifest)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Upload pending emojis (if any)
+    from scripts.bufo_rollout.upload import check_upload_deps, load_credentials, upload_emoji, BUFO_META_CHANNEL_ID, BUFO_TEST_CHANNEL_ID
+
     success = 0
     fail = 0
 
-    for e in pending:
-        file_path = IMAGE_DIR / e["source_file"]
-        print(f"  Uploading :{e['slack_name']}: ... ", end="", flush=True)
+    if pending:
+        if not check_upload_deps():
+            return 1
 
-        if upload_emoji(e["slack_name"], file_path, cookie_d, workspace, token):
-            mark_uploaded(manifest, e["slack_name"], now)
-            save_manifest(manifest)  # Crash-safe: save after each
-            print("OK")
-            success += 1
-        else:
-            print("FAILED")
-            fail += 1
+        creds = load_credentials()
+        if not creds:
+            return 1
+        cookie_d, workspace, token = creds
 
-    print(f"\nDone. {success} uploaded, {fail} failed.")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        for e in pending:
+            file_path = IMAGE_DIR / e["source_file"]
+            print(f"  Uploading :{e['slack_name']}: ... ", end="", flush=True)
+
+            if upload_emoji(e["slack_name"], file_path, cookie_d, workspace, token):
+                mark_uploaded(manifest, e["slack_name"], now)
+                save_manifest(manifest)  # Crash-safe: save after each
+                print("OK")
+                success += 1
+            else:
+                print("FAILED")
+                fail += 1
+
+        print(f"\nDone. {success} uploaded, {fail} failed.")
+
+    # Send batch announcement via bot
+    if announcement:
+        if not pending or success > 0:
+            from scripts.bufo_rollout.announce import strip_puzzle_grid_spaces
+            from scripts.bufo_rollout.upload import load_bot_token, post_message, update_message
+
+            bot_token = load_bot_token()
+            if not bot_token:
+                return 1
+
+            channel_id = BUFO_META_CHANNEL_ID if args.live else BUFO_TEST_CHANNEL_ID
+            target = "#bufo-meta" if args.live else "#bufo-test"
+
+            # Post with spaces (so Slack renders emoji), then edit to remove them
+            final_text = strip_puzzle_grid_spaces(announcement)
+            needs_edit = final_text != announcement
+
+            print(f"\n  Posting announcement to {target}...")
+            ts = post_message(announcement, channel_id, bot_token)
+            if ts:
+                print("  Announcement posted!")
+                if needs_edit:
+                    time.sleep(2)
+                    print("  Editing to remove grid spaces...")
+                    if update_message(final_text, channel_id, ts, bot_token):
+                        print("  Edit applied!")
+                    else:
+                        print("  Edit failed (announcement still has spaces).")
+
+                # Post roll call as separate message(s)
+                for i, rc_chunk in enumerate(roll_call):
+                    time.sleep(1)
+                    label = f"roll call ({i+1}/{len(roll_call)})" if len(roll_call) > 1 else "roll call"
+                    print(f"  Posting {label}...")
+                    rc_ts = post_message(rc_chunk, channel_id, bot_token)
+                    if rc_ts:
+                        print(f"  {label.capitalize()} posted!")
+                    else:
+                        print(f"  {label.capitalize()} failed to post.")
+            else:
+                print("  Announcement failed to post.")
+
     return 0 if fail == 0 else 1
 
 
@@ -211,9 +271,70 @@ def cmd_mark_external(args):
     return 0
 
 
+def cmd_rollback(args):
+    """Roll back a batch: remove emojis from Slack and reset to pending."""
+    manifest = load_manifest()
+
+    batch_num = args.batch
+    batch_emojis = get_batch_emojis(manifest, batch_num)
+
+    if not batch_emojis:
+        print(f"No emojis in batch {batch_num}.")
+        return 1
+
+    uploaded = [e for e in batch_emojis if e["status"] == "uploaded"]
+    if not uploaded:
+        print(f"Batch {batch_num}: no uploaded emojis to roll back.")
+        return 0
+
+    print(f"Batch {batch_num}: will roll back {len(uploaded)} emoji:")
+    for e in uploaded:
+        print(f"  :{e['slack_name']}:")
+
+    confirm = input(f"\nRemove these {len(uploaded)} emoji from Slack and reset to pending? (y/N) ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        return 0
+
+    from scripts.bufo_rollout.upload import check_upload_deps, load_credentials, remove_emoji
+
+    if not check_upload_deps():
+        return 1
+
+    creds = load_credentials()
+    if not creds:
+        return 1
+    cookie_d, workspace, token = creds
+
+    removed = 0
+    failed = 0
+
+    for e in uploaded:
+        print(f"  Removing :{e['slack_name']}: ... ", end="", flush=True)
+        if remove_emoji(e["slack_name"], cookie_d, workspace, token):
+            mark_pending(manifest, e["slack_name"])
+            save_manifest(manifest)
+            print("OK")
+            removed += 1
+        else:
+            print("FAILED")
+            failed += 1
+
+    # Clear saved announcement for this batch
+    announcements = manifest.get("batch_announcements", {})
+    if str(batch_num) in announcements:
+        del announcements[str(batch_num)]
+        save_manifest(manifest)
+
+    print(f"\nDone. {removed} removed, {failed} failed.")
+    return 0 if failed == 0 else 1
+
+
 def cmd_sync(args):
-    """Sync new bufos from origin/main."""
-    sync_new_bufos()
+    """Sync new bufos from origin/main, upload, and announce."""
+    count = sync_new_bufos(auto=args.auto, live=args.live)
+    if count > 0:
+        print(f"\n{count} new bufo successfully deployed!")
     return 0
 
 
@@ -265,6 +386,8 @@ def main():
     p_upload.add_argument("--today", action="store_true", help="Upload today's batch")
     p_upload.add_argument("--batch", type=int, help="Upload a specific batch")
     p_upload.add_argument("--dry-run", action="store_true", help="Preview without uploading")
+    p_upload.add_argument("--no-announce", action="store_true", help="Skip announcement review")
+    p_upload.add_argument("--live", action="store_true", help="Post announcement to #bufo-meta (default: #bufo-test)")
 
     # mark-uploaded
     p_mark = sub.add_parser("mark-uploaded", help="Manually mark emoji(s) as uploaded")
@@ -276,8 +399,14 @@ def main():
     p_ext.add_argument("--name", required=True, help="Slack emoji name")
     p_ext.add_argument("--who", required=True, help="Who uploaded it")
 
+    # rollback
+    p_rollback = sub.add_parser("rollback", help="Remove a batch from Slack and reset to pending")
+    p_rollback.add_argument("--batch", type=int, required=True, help="Batch number to roll back")
+
     # sync
-    sub.add_parser("sync", help="Fetch origin/main and integrate new bufos")
+    p_sync = sub.add_parser("sync", help="Pull new bufo from upstream, upload, and announce")
+    p_sync.add_argument("--auto", action="store_true", help="Non-interactive mode (for scheduled runs)")
+    p_sync.add_argument("--live", action="store_true", help="Announce to #bufo-meta (default: #bufo-test)")
 
     # schedule
     sub.add_parser("schedule", help="Print the Fibonacci schedule")
@@ -299,6 +428,7 @@ def main():
         "upload": cmd_upload,
         "mark-uploaded": cmd_mark_uploaded,
         "mark-external": cmd_mark_external,
+        "rollback": cmd_rollback,
         "sync": cmd_sync,
         "schedule": cmd_schedule,
         "validate": cmd_validate,

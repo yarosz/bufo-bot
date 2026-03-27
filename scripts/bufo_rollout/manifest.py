@@ -70,6 +70,17 @@ def mark_external(manifest: dict, slack_name: str, who: str, upload_date: str) -
     return False
 
 
+def mark_pending(manifest: dict, slack_name: str) -> bool:
+    """Reset an emoji back to pending. Returns True if found."""
+    emoji = find_emoji(manifest, slack_name)
+    if emoji:
+        emoji["status"] = "pending"
+        emoji.pop("upload_date", None)
+        emoji.pop("uploaded_by", None)
+        return True
+    return False
+
+
 def mark_skipped(manifest: dict, slack_name: str, reason: str = None) -> bool:
     """Mark an emoji as skipped. Returns True if found."""
     emoji = find_emoji(manifest, slack_name)
@@ -78,6 +89,18 @@ def mark_skipped(manifest: dict, slack_name: str, reason: str = None) -> bool:
         emoji["notes"] = reason
         return True
     return False
+
+
+def get_announcement(manifest: dict, batch_num: int) -> str | None:
+    """Get the saved announcement for a batch, if any."""
+    return manifest.get("batch_announcements", {}).get(str(batch_num))
+
+
+def set_announcement(manifest: dict, batch_num: int, text: str) -> None:
+    """Save an announcement for a batch."""
+    if "batch_announcements" not in manifest:
+        manifest["batch_announcements"] = {}
+    manifest["batch_announcements"][str(batch_num)] = text
 
 
 def validate_manifest(manifest: dict) -> list[str]:
@@ -102,10 +125,12 @@ def validate_manifest(manifest: dict) -> list[str]:
         if e["batch"] not in schedule_days:
             issues.append(f"Emoji {e['slack_name']} assigned to non-existent batch {e['batch']}")
 
-    # Check batch sizes match schedule
+    # Check batch sizes match schedule (skip community batch — it grows dynamically)
     from collections import Counter
     batch_counts = Counter(e["batch"] for e in manifest["emojis"])
     for s in manifest["schedule"]:
+        if s["day"] == "community":
+            continue
         actual = batch_counts.get(s["day"], 0)
         if actual != s["batch_size"]:
             issues.append(

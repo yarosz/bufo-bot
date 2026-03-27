@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bufo Description Review</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+  h1 { text-align: center; margin-bottom: 8px; color: #7fefbd; }
+  .stats { text-align: center; margin-bottom: 16px; color: #888; font-size: 14px; }
+  .controls { display: flex; gap: 12px; justify-content: center; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .controls input[type="text"] { padding: 8px 14px; border-radius: 8px; border: 1px solid #444; background: #2a2a4a; color: #e0e0e0; font-size: 14px; width: 300px; }
+  .controls select, .controls button { padding: 8px 14px; border-radius: 8px; border: 1px solid #444; background: #2a2a4a; color: #e0e0e0; font-size: 14px; cursor: pointer; }
+  .controls button.save { background: #2e7d32; border-color: #4caf50; font-weight: 600; }
+  .controls button.save:hover { background: #388e3c; }
+  .controls button.save.saving { background: #555; }
+  .controls button.export { background: #1565c0; border-color: #42a5f5; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(540px, 1fr)); gap: 12px; }
+  .card { display: grid; grid-template-columns: 80px 1fr; gap: 12px; background: #16213e; border: 1px solid #333; border-radius: 10px; padding: 12px; align-items: start; transition: border-color 0.2s; }
+  .card.dirty { border-color: #f9a825; }
+  .card.rv-edited { border-left: 3px solid #7fefbd; }
+  .card.rv-approved { border-left: 3px solid #42a5f5; }
+  .card img { width: 64px; height: 64px; object-fit: contain; border-radius: 6px; background: #222; image-rendering: pixelated; cursor: pointer; transition: transform 0.15s; }
+  .card img:hover { transform: scale(2.5); position: relative; z-index: 10; }
+  .info { display: flex; flex-direction: column; gap: 6px; }
+  .name-row { display: flex; align-items: center; gap: 8px; }
+  .name { font-weight: 600; font-size: 13px; color: #7fefbd; font-family: monospace; }
+  .badges { display: flex; gap: 4px; flex-wrap: wrap; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 4px; }
+  .badge.animated { background: #6a1b9a; color: #e1bee7; }
+  .badge.has-ref { background: #1565c0; color: #bbdefb; }
+  .badge.no-desc { background: #b71c1c; color: #ffcdd2; }
+  .badge.rv-edited { background: #1b5e20; color: #a5d6a7; }
+  .badge.rv-approved { background: #0d47a1; color: #90caf9; }
+  .badge.rv-none { background: #424242; color: #999; }
+  .desc-row { display: flex; gap: 6px; align-items: start; }
+  .desc-input { flex: 1; padding: 6px 8px; border-radius: 6px; border: 1px solid #444; background: #0f3460; color: #e0e0e0; font-size: 13px; font-family: inherit; resize: vertical; min-height: 38px; line-height: 1.4; }
+  .desc-input:focus { border-color: #7fefbd; outline: none; }
+  .desc-input.empty { border-color: #b71c1c; background: #1a0000; }
+  .approve-btn { padding: 4px 8px; border-radius: 6px; border: 1px solid #444; background: #2a2a4a; color: #999; font-size: 18px; cursor: pointer; line-height: 1; flex-shrink: 0; transition: all 0.15s; }
+  .approve-btn:hover { background: #1b5e20; color: #7fefbd; border-color: #4caf50; }
+  .approve-btn.active { background: #1b5e20; color: #7fefbd; border-color: #4caf50; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #2e7d32; color: white; padding: 12px 20px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; }
+  .counter { position: fixed; bottom: 20px; left: 20px; background: #16213e; border: 1px solid #333; padding: 8px 14px; border-radius: 8px; font-size: 13px; z-index: 100; }
+</style>
+</head>
+<body>
+
+<h1>Bufo Description Review</h1>
+<div class="stats" id="stats"></div>
+
+<div class="controls">
+  <input type="text" id="search" placeholder="Search names or descriptions...">
+  <select id="filter">
+    <option value="all">All emoji</option>
+    <option value="has-desc">Has description</option>
+    <option value="no-desc">Missing description</option>
+    <option value="animated">Animated / GIF</option>
+    <option value="dirty">Edited this session</option>
+    <option value="has-ref">Has 'See also'</option>
+    <option value="rv-edited">Reviewed: edited</option>
+    <option value="rv-approved">Reviewed: approved</option>
+    <option value="rv-any">Reviewed: any</option>
+    <option value="rv-none">Unreviewed</option>
+  </select>
+  <button class="save" id="saveBtn" onclick="saveAll()">Save all (Cmd+S)</button>
+  <button class="export" onclick="exportJSON()">Export JSON</button>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<div class="toast" id="toast"></div>
+<div class="counter" id="counter"></div>
+
+<script>
+let manifest = null;
+let descriptions = {};
+let reviews = {};
+let dirtyDescs = new Set();
+let dirtyReviews = new Set();
+const IMAGE_BASE = '/images/';
+
+function today() { return new Date().toISOString().slice(0, 10); }
+
+async function init() {
+  const [mRes, dRes, rRes] = await Promise.all([
+    fetch('/data/manifest'),
+    fetch('/data/descriptions'),
+    fetch('/data/reviews'),
+  ]);
+  manifest = await mRes.json();
+  descriptions = await dRes.json();
+  reviews = await rRes.json();
+
+  const puzzleRe = /^(.+)_(\d+)_(\d+)$/;
+  const emoji = manifest.emojis
+    .filter(e => e.status === 'uploaded' && !puzzleRe.test(e.slack_name))
+    .sort((a, b) => a.slack_name.localeCompare(b.slack_name));
+
+  window._emoji = emoji;
+  updateStats();
+  render(emoji);
+
+  document.getElementById('search').addEventListener('input', applyFilters);
+  document.getElementById('filter').addEventListener('change', applyFilters);
+
+  document.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveAll(); }
+  });
+}
+
+function updateStats() {
+  const emoji = window._emoji || [];
+  const described = emoji.filter(e => descriptions[e.slack_name]).length;
+  const total = emoji.length;
+  const rvEdited = Object.values(reviews).filter(r => r.status === 'edited').length;
+  const rvApproved = Object.values(reviews).filter(r => r.status === 'approved').length;
+  document.getElementById('stats').innerHTML =
+    `${described} described / ${total} total | ${total - described} missing<br>` +
+    `<span style="color:#7fefbd">${rvEdited} human-edited</span> · ` +
+    `<span style="color:#42a5f5">${rvApproved} approved</span> · ` +
+    `<span style="color:#999">${total - rvEdited - rvApproved} unreviewed</span>`;
+}
+
+function applyFilters() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const f = document.getElementById('filter').value;
+  let filtered = window._emoji;
+
+  if (q) {
+    filtered = filtered.filter(e =>
+      e.slack_name.includes(q) ||
+      (descriptions[e.slack_name] || '').toLowerCase().includes(q) ||
+      e.source_file.toLowerCase().includes(q)
+    );
+  }
+
+  if (f === 'has-desc') filtered = filtered.filter(e => descriptions[e.slack_name]);
+  if (f === 'no-desc') filtered = filtered.filter(e => !descriptions[e.slack_name]);
+  if (f === 'animated') filtered = filtered.filter(e => (descriptions[e.slack_name] || '').includes('(animated)') || e.source_file.endsWith('.gif'));
+  if (f === 'dirty') filtered = filtered.filter(e => dirtyDescs.has(e.slack_name));
+  if (f === 'has-ref') filtered = filtered.filter(e => (descriptions[e.slack_name] || '').includes('See also'));
+  if (f === 'rv-edited') filtered = filtered.filter(e => reviews[e.slack_name]?.status === 'edited');
+  if (f === 'rv-approved') filtered = filtered.filter(e => reviews[e.slack_name]?.status === 'approved');
+  if (f === 'rv-any') filtered = filtered.filter(e => reviews[e.slack_name]);
+  if (f === 'rv-none') filtered = filtered.filter(e => !reviews[e.slack_name]);
+
+  render(filtered);
+}
+
+function getReviewStatus(name) {
+  return reviews[name]?.status || null;
+}
+
+function setReviewStatus(name, status) {
+  reviews[name] = { status, date: today() };
+  dirtyReviews.add(name);
+  updateStats();
+}
+
+function render(emoji) {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  for (const e of emoji) {
+    const desc = descriptions[e.slack_name] || '';
+    const isAnimated = e.source_file.endsWith('.gif') || desc.includes('(animated)');
+    const hasSeeAlso = desc.includes('See also');
+    const isDirty = dirtyDescs.has(e.slack_name);
+    const noDesc = !desc;
+    const rv = getReviewStatus(e.slack_name);
+
+    const card = document.createElement('div');
+    let cls = 'card';
+    if (isDirty) cls += ' dirty';
+    if (rv === 'edited') cls += ' rv-edited';
+    else if (rv === 'approved') cls += ' rv-approved';
+    card.className = cls;
+    card.dataset.name = e.slack_name;
+
+    const img = document.createElement('img');
+    img.src = IMAGE_BASE + encodeURIComponent(e.source_file);
+    img.alt = e.slack_name;
+    img.loading = 'lazy';
+
+    const info = document.createElement('div');
+    info.className = 'info';
+
+    // Name row with badges
+    const nameRow = document.createElement('div');
+    nameRow.className = 'name-row';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'name';
+    nameSpan.textContent = ':' + e.slack_name + ':';
+    nameRow.appendChild(nameSpan);
+
+    const badges = document.createElement('div');
+    badges.className = 'badges';
+    if (isAnimated) badges.innerHTML += '<span class="badge animated">animated</span>';
+    if (hasSeeAlso) badges.innerHTML += '<span class="badge has-ref">see also</span>';
+    if (noDesc) badges.innerHTML += '<span class="badge no-desc">no description</span>';
+    if (rv === 'edited') badges.innerHTML += '<span class="badge rv-edited">human-edited</span>';
+    else if (rv === 'approved') badges.innerHTML += '<span class="badge rv-approved">approved</span>';
+    nameRow.appendChild(badges);
+
+    // Description row with approve button
+    const descRow = document.createElement('div');
+    descRow.className = 'desc-row';
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'desc-input' + (noDesc ? ' empty' : '');
+    textarea.value = desc;
+    textarea.placeholder = 'No description yet...';
+    textarea.rows = 2;
+    textarea.dataset.name = e.slack_name;
+    textarea.addEventListener('input', function() {
+      const name = this.dataset.name;
+      descriptions[name] = this.value;
+      dirtyDescs.add(name);
+      this.closest('.card').classList.add('dirty');
+      this.classList.toggle('empty', !this.value);
+      // Editing auto-marks as "edited" review status
+      setReviewStatus(name, 'edited');
+      updateCardBadges(this.closest('.card'), name);
+      updateCounter();
+      this.style.height = 'auto';
+      this.style.height = this.scrollHeight + 'px';
+    });
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'approve-btn' + (rv ? ' active' : '');
+    approveBtn.textContent = rv === 'edited' ? '\u270e' : rv === 'approved' ? '\u2713' : '\u2713';
+    approveBtn.title = rv ? `${rv} on ${reviews[e.slack_name]?.date}` : 'Mark as approved';
+    approveBtn.dataset.name = e.slack_name;
+    approveBtn.addEventListener('click', function() {
+      const name = this.dataset.name;
+      const current = getReviewStatus(name);
+      if (current === 'approved') {
+        // Toggle off
+        delete reviews[name];
+        dirtyReviews.add(name);
+        this.classList.remove('active');
+        this.textContent = '\u2713';
+        this.title = 'Mark as approved';
+      } else if (current === 'edited') {
+        // Don't downgrade edited status — just show tooltip
+        showToast('This one was human-edited — cannot downgrade to approved');
+        return;
+      } else {
+        setReviewStatus(name, 'approved');
+        this.classList.add('active');
+        this.textContent = '\u2713';
+        this.title = `approved on ${today()}`;
+      }
+      updateCardBadges(this.closest('.card'), name);
+      updateStats();
+    });
+
+    descRow.appendChild(textarea);
+    descRow.appendChild(approveBtn);
+
+    info.appendChild(nameRow);
+    info.appendChild(descRow);
+    card.appendChild(img);
+    card.appendChild(info);
+    grid.appendChild(card);
+  }
+
+  updateCounter();
+
+  requestAnimationFrame(() => {
+    grid.querySelectorAll('textarea').forEach(ta => {
+      ta.style.height = 'auto';
+      ta.style.height = ta.scrollHeight + 'px';
+    });
+  });
+}
+
+function updateCardBadges(card, name) {
+  const rv = getReviewStatus(name);
+  card.classList.remove('rv-edited', 'rv-approved');
+  if (rv === 'edited') card.classList.add('rv-edited');
+  else if (rv === 'approved') card.classList.add('rv-approved');
+
+  // Update badge
+  card.querySelectorAll('.badge.rv-edited, .badge.rv-approved').forEach(b => b.remove());
+  const badges = card.querySelector('.badges');
+  if (rv === 'edited') badges.innerHTML += '<span class="badge rv-edited">human-edited</span>';
+  else if (rv === 'approved') badges.innerHTML += '<span class="badge rv-approved">approved</span>';
+
+  // Update button
+  const btn = card.querySelector('.approve-btn');
+  btn.classList.toggle('active', !!rv);
+  btn.textContent = rv === 'edited' ? '\u270e' : '\u2713';
+  btn.title = rv ? `${rv} on ${reviews[name]?.date}` : 'Mark as approved';
+}
+
+function updateCounter() {
+  const showing = document.querySelectorAll('.card').length;
+  const dirty = dirtyDescs.size + dirtyReviews.size;
+  let text = `Showing ${showing} emoji`;
+  if (dirty > 0) text += ` | ${dirty} unsaved changes`;
+  document.getElementById('counter').textContent = text;
+}
+
+async function saveAll() {
+  const btn = document.getElementById('saveBtn');
+  btn.textContent = 'Saving...';
+  btn.classList.add('saving');
+
+  const toSaveDescs = {};
+  for (const [k, v] of Object.entries(descriptions)) {
+    if (v && v.trim()) toSaveDescs[k] = v.trim();
+  }
+
+  const [r1, r2] = await Promise.all([
+    fetch('/data/descriptions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(toSaveDescs),
+    }),
+    fetch('/data/reviews', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reviews),
+    }),
+  ]);
+
+  if (r1.ok && r2.ok) {
+    showToast(`Saved ${Object.keys(toSaveDescs).length} descriptions + ${Object.keys(reviews).length} reviews`);
+    dirtyDescs.clear();
+    dirtyReviews.clear();
+    document.querySelectorAll('.card.dirty').forEach(c => c.classList.remove('dirty'));
+    updateCounter();
+  } else {
+    showToast('Save failed!');
+  }
+  btn.textContent = 'Save all (Cmd+S)';
+  btn.classList.remove('saving');
+}
+
+function exportJSON() {
+  const toExport = {};
+  for (const [k, v] of Object.entries(descriptions)) {
+    if (v && v.trim()) toExport[k] = v.trim();
+  }
+  const blob = new Blob([JSON.stringify(toExport, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'bufo-descriptions.json';
+  a.click();
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 2500);
+}
+
+init();
+</script>
+</body>
+</html>
