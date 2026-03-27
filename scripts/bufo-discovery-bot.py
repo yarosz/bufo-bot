@@ -200,9 +200,11 @@ def load_emoji_catalog() -> str:
 
     # Load manifest
     try:
+        if not MANIFEST_PATH.is_file():
+            raise FileNotFoundError
         with open(MANIFEST_PATH) as f:
             manifest = json.load(f)
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         log.warning("Manifest not found at %s. /bufo-suggest will not work.", MANIFEST_PATH)
         return ""
 
