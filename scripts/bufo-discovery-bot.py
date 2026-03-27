@@ -266,14 +266,76 @@ Available bufo emoji ({len(emoji_names)} total):
     return _suggest_system_prompt
 
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
 def suggest_bufo(situation: str) -> str | None:
-    """Call claude CLI with haiku to get bufo suggestions.
+    """Get bufo suggestions via Anthropic API (preferred) or claude CLI (fallback).
 
     Returns the suggestion text, or None on error.
     """
     if not _suggest_system_prompt:
         return None
 
+    if ANTHROPIC_API_KEY:
+        return _suggest_via_api(situation)
+    return _suggest_via_cli(situation)
+
+
+def _suggest_via_api(situation: str) -> str | None:
+    """Call Anthropic API directly with Haiku and prompt caching."""
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "prompt-caching-2024-07-31",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "system": [
+                    {
+                        "type": "text",
+                        "text": _suggest_system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                "messages": [{"role": "user", "content": f"Situation: {situation}"}],
+            },
+            timeout=30,
+        )
+        result = resp.json()
+
+        if resp.status_code != 200:
+            log.warning("/bufo-suggest API error (%d): %s", resp.status_code, result.get("error", {}).get("message", ""))
+            return None
+
+        # Log cache performance
+        usage = result.get("usage", {})
+        cached = usage.get("cache_read_input_tokens", 0)
+        if cached:
+            log.info("/bufo-suggest cache hit: %d tokens cached", cached)
+
+        text = result.get("content", [{}])[0].get("text", "").strip()
+        if not text:
+            log.warning("/bufo-suggest API returned empty response.")
+            return None
+
+        return text
+
+    except requests.Timeout:
+        log.warning("/bufo-suggest API timed out after 30s.")
+        return None
+    except Exception as e:
+        log.warning("/bufo-suggest API error: %s", e)
+        return None
+
+
+def _suggest_via_cli(situation: str) -> str | None:
+    """Fallback: call claude CLI with haiku."""
     prompt = f"{_suggest_system_prompt}\n\n---\n\nSituation: {situation}"
 
     try:
@@ -286,11 +348,11 @@ def suggest_bufo(situation: str) -> str | None:
         )
         stdout, stderr = proc.communicate(input=prompt, timeout=30)
     except FileNotFoundError:
-        log.error("claude CLI not found. /bufo-suggest will not work.")
+        log.error("claude CLI not found and no ANTHROPIC_API_KEY set. /bufo-suggest will not work.")
         return None
     except subprocess.TimeoutExpired:
         proc.kill()
-        log.warning("/bufo-suggest timed out after 30s.")
+        log.warning("/bufo-suggest CLI timed out after 30s.")
         return None
 
     if proc.returncode != 0:
@@ -299,7 +361,7 @@ def suggest_bufo(situation: str) -> str | None:
 
     result = stdout.strip()
     if not result:
-        log.warning("/bufo-suggest returned empty response.")
+        log.warning("/bufo-suggest CLI returned empty response.")
         return None
 
     return result
@@ -331,97 +393,61 @@ def handle_slash_command(payload: dict):
         "text": f":bufo-inspecting: Finding the perfect bufo for _{text}_...",
     })
 
-    # Strip URLs from input to prevent the model from accessing external content
-    sanitized_text = re.sub(r'https?://\S+', '[link removed]', text)
+    # Call suggest in a background thread with progress updates
+    thinks_emoji = [
+        "bufo-thinks-about-a11y", "bufo-thinks-about-azure",
+        "bufo-thinks-about-azure-front-door", "bufo-thinks-about-azure-front-door-intensifies",
+        "bufo-thinks-about-cheeky-nandos", "bufo-thinks-about-chocolate",
+        "bufo-thinks-about-climbing", "bufo-thinks-about-docs",
+        "bufo-thinks-about-fishsticks", "bufo-thinks-about-mountains",
+        "bufo-thinks-about-omelette", "bufo-thinks-about-pancakes",
+        "bufo-thinks-about-quarter", "bufo-thinks-about-redis",
+        "bufo-thinks-about-rubberduck", "bufo-thinks-about-slack",
+        "bufo-thinks-about-steak", "bufo-thinks-about-steakholder",
+        "bufo-thinks-about-teams", "bufo-thinks-about-telemetry",
+        "bufo-thinks-about-terraform", "bufo-thinks-about-ufo",
+        "bufo-thinks-about-vacation",
+    ]
 
-    # Call Haiku in a background thread with progress updates
     def do_suggest():
-        # Start the CLI call
-        try:
-            proc = subprocess.Popen(
-                ["claude", "-p", "--model", "haiku"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            proc.stdin.write(_suggest_system_prompt + f"\n\n---\n\nSituation: {sanitized_text}")
-            proc.stdin.close()
-        except FileNotFoundError:
-            log.error("claude CLI not found.")
-            report_error("/bufo-suggest failed: `claude` CLI not found on host.")
-            requests.post(response_url, json={
-                "response_type": "ephemeral",
-                "replace_original": True,
-                "text": ":bufo-shrug: Bufo's brain is temporarily unavailable. Try again in a moment.",
-            })
-            return
-
-        # Poll with progress updates using random bufo-thinks-about-* emoji
-        thinks_emoji = [
-            "bufo-thinks-about-a11y", "bufo-thinks-about-azure",
-            "bufo-thinks-about-azure-front-door", "bufo-thinks-about-azure-front-door-intensifies",
-            "bufo-thinks-about-cheeky-nandos", "bufo-thinks-about-chocolate",
-            "bufo-thinks-about-climbing", "bufo-thinks-about-docs",
-            "bufo-thinks-about-fishsticks", "bufo-thinks-about-mountains",
-            "bufo-thinks-about-omelette", "bufo-thinks-about-pancakes",
-            "bufo-thinks-about-quarter", "bufo-thinks-about-redis",
-            "bufo-thinks-about-rubberduck", "bufo-thinks-about-slack",
-            "bufo-thinks-about-steak", "bufo-thinks-about-steakholder",
-            "bufo-thinks-about-teams", "bufo-thinks-about-telemetry",
-            "bufo-thinks-about-terraform", "bufo-thinks-about-ufo",
-            "bufo-thinks-about-vacation",
-        ]
+        # Send progress updates from a separate thread
+        done = threading.Event()
         shuffled = random.sample(thinks_emoji, min(3, len(thinks_emoji)))
-        update_schedule = [2, 6, 14]  # exponential-ish: fast feedback, then slower
-        elapsed = 0
-        tick = 0
-        while proc.poll() is None:
-            time.sleep(1)
-            elapsed += 1
-            if elapsed >= 30:
-                proc.kill()
-                log.warning("/bufo-suggest timed out after 30s.")
-                report_error("/bufo-suggest timed out after 30s.")
-                requests.post(response_url, json={
-                    "response_type": "ephemeral",
-                    "text": ":bufo-shrug: Bufo's brain is temporarily slow. Try again in a moment.",
-                })
-                return
-            if tick < len(update_schedule) and tick < len(shuffled) and elapsed >= update_schedule[tick]:
-                resp = requests.post(response_url, json={
-                    "response_type": "ephemeral",
-                    "text": f":{shuffled[tick]}:",
-                })
-                if not resp.ok:
-                    log.warning("/bufo-suggest progress update %d failed (HTTP %d): %s",
-                                tick + 1, resp.status_code, resp.text[:200])
-                tick += 1
+        update_schedule = [2, 6, 14]
 
-        stdout = proc.stdout.read().strip()
-        stderr = proc.stderr.read().strip()
+        def send_progress():
+            tick = 0
+            elapsed = 0
+            while not done.is_set():
+                time.sleep(1)
+                elapsed += 1
+                if tick < len(update_schedule) and tick < len(shuffled) and elapsed >= update_schedule[tick]:
+                    resp = requests.post(response_url, json={
+                        "response_type": "ephemeral",
+                        "text": f":{shuffled[tick]}:",
+                    })
+                    if not resp.ok:
+                        log.warning("/bufo-suggest progress update %d failed (HTTP %d): %s",
+                                    tick + 1, resp.status_code, resp.text[:200])
+                    tick += 1
 
-        if proc.returncode != 0:
-            log.warning("/bufo-suggest CLI error (exit %d): %s", proc.returncode, stderr[:200])
-            report_error(f"/bufo-suggest CLI error (exit {proc.returncode})")
-            requests.post(response_url, json={
-                "response_type": "ephemeral",
-                "replace_original": True,
-                "text": ":bufo-shrug: Bufo's brain is temporarily unavailable. Try again in a moment.",
-            })
-            return
+        progress_thread = threading.Thread(target=send_progress, daemon=True)
+        progress_thread.start()
 
-        if stdout:
-            validated = validate_suggestions(stdout)
+        result = suggest_bufo(text)
+        done.set()
+
+        if result:
+            validated = validate_suggestions(result)
             requests.post(response_url, json={
                 "response_type": "ephemeral",
                 "text": validated or ":bufo-shrug: Bufo drew a blank. Try rephrasing?",
             })
         else:
+            report_error("/bufo-suggest failed to get a response.")
             requests.post(response_url, json={
                 "response_type": "ephemeral",
-                "replace_original": True,
-                "text": ":bufo-shrug: Bufo drew a blank. Try rephrasing?",
+                "text": ":bufo-shrug: Bufo's brain is temporarily unavailable. Try again in a moment.",
             })
 
     threading.Thread(target=do_suggest, daemon=True).start()
@@ -816,6 +842,8 @@ def run_socket_mode():
     log.info("Monitoring all channels Bufo is a member of, all bufo emoji, plus-one filtering ON")
     check_canvas_access()
     load_emoji_catalog()
+    suggest_backend = "Anthropic API (with prompt caching)" if ANTHROPIC_API_KEY else "claude CLI (fallback)"
+    log.info("/bufo-suggest backend: %s", suggest_backend)
     client.connect()
     log.info("Connected! Listening for bufo reactions and /bufo-suggest...")
     report_to_test(f":bufo-standing: Bufo bot started ({mode}).")
